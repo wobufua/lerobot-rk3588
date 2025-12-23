@@ -1,0 +1,253 @@
+# Copyright 2024 The HuggingFace Inc. team.
+# ==========================================================
+# ✅ 必须最先注册设备（否则 so100_follower / camera 等不会被识别）
+# ==========================================================
+from lerobot.utils.import_utils import register_third_party_devices
+register_third_party_devices()
+
+# ✅ 注册 OpenCV / RealSense 相机（即使用不到也建议注册）
+from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
+from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
+
+# ==========================================================
+# Python 标准库
+# ==========================================================
+import socket
+import json
+import threading
+import logging
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from pprint import pformat
+
+# ==========================================================
+# lerobot 相关
+# ==========================================================
+from lerobot.configs import parser
+from lerobot.datasets.image_writer import safe_stop_image_writer
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
+
+from lerobot.processor import (
+    RobotAction,
+    RobotObservation,
+    RobotProcessorPipeline,
+    make_default_processors,
+)
+
+from lerobot.robots import (
+    RobotConfig,
+    make_robot_from_config,
+    so100_follower,
+    so101_follower,
+    bi_so100_follower,
+)
+
+from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.control_utils import (
+    init_keyboard_listener,
+    is_headless,
+)
+from lerobot.utils.robot_utils import busy_wait
+from lerobot.utils.utils import (
+    init_logging,
+    log_say,
+)
+
+# ==========================================================
+# ✅ TCP 接收主臂关节数据
+# ==========================================================
+
+LATEST_TCP_ACTION = {}
+
+TCP_HOST = "10.131.98.53"   # ROS2 那台 IP
+TCP_PORT = 9002              # 你 TCP 服务端端口
+
+
+def tcp_client_loop():
+    """
+    持续接收主臂通过 TCP 发送的数据
+    数据格式：一行一个 JSON， \n 分割
+    """
+    global LATEST_TCP_ACTION
+
+    print(f"🔌 [TCP] Connecting to {TCP_HOST}:{TCP_PORT}")
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((TCP_HOST, TCP_PORT))
+            sock.settimeout(1)
+
+            print("✅ [TCP] Connected")
+
+            buffer = b""
+
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    raise ConnectionError("TCP closed by server")
+
+                buffer += data
+
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+
+                    try:
+                        LATEST_TCP_ACTION = json.loads(
+                            line.decode("utf-8", errors="ignore")
+                        )
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            print(f"❌ [TCP] Disconnected, retrying... {e}")
+            time.sleep(2)
+
+
+# ==========================================================
+# Dataset Config
+# ==========================================================
+
+@dataclass
+class DatasetRecordConfig:
+    repo_id: str
+    single_task: str
+    root: str | Path | None = None
+    fps: int = 30
+    episode_time_s: float = 999999
+    num_episodes: int = 1
+    video: bool = False
+    push_to_hub: bool = False
+    private: bool = False
+
+    def __post_init__(self):
+        if self.single_task is None:
+            raise ValueError("single_task required")
+
+
+@dataclass
+class RecordConfig:
+    robot: RobotConfig
+    dataset: DatasetRecordConfig
+    display_data: bool = False
+    play_sounds: bool = False
+    resume: bool = False
+
+
+# ==========================================================
+# Record Loop（实时控制）
+# ==========================================================
+
+@safe_stop_image_writer
+def record_loop(
+    robot,
+    events: dict,
+    fps: int,
+    teleop_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    robot_action_processor: RobotProcessorPipeline[
+        tuple[RobotAction, RobotObservation], RobotAction
+    ],
+    robot_observation_processor: RobotProcessorPipeline[
+        RobotObservation, RobotObservation
+    ],
+    control_time_s: int | None = None,
+    display_data: bool = False,
+):
+
+    timestamp = 0
+    start_episode_t = time.perf_counter()
+
+    print("🚀 Follower loop running...")
+
+    while timestamp < control_time_s:
+
+        start_loop_t = time.perf_counter()
+
+        if events.get("exit_early", False):
+            events["exit_early"] = False
+            break
+
+        # 获取当前观测
+        obs = robot.get_observation()
+        obs_processed = robot_observation_processor(obs)
+
+        # 如果还没收到 TCP 动作 → 等待
+        if not LATEST_TCP_ACTION:
+            busy_wait(1 / fps)
+            timestamp = time.perf_counter() - start_episode_t
+            continue
+
+        # 来自主臂的数据
+        act = LATEST_TCP_ACTION
+        print(act)
+        # 通过 LeRobot 处理链
+        act_processed = teleop_action_processor((act, obs))
+        robot_action_to_send = robot_action_processor((act_processed, obs))
+
+        # 发送给从臂
+        robot.send_action(robot_action_to_send)
+
+        dt = time.perf_counter() - start_loop_t
+        if dt < 1 / fps:
+            busy_wait(1 / fps - dt)
+
+        timestamp = time.perf_counter() - start_episode_t
+
+
+# ==========================================================
+# 主逻辑
+# ==========================================================
+
+@parser.wrap()
+def record(cfg: RecordConfig):
+
+    init_logging()
+    logging.info(pformat(asdict(cfg)))
+
+    # ✅ 启动 TCP 接收线程
+    threading.Thread(target=tcp_client_loop, daemon=True).start()
+
+    print("✅ TCP thread started")
+
+    robot = make_robot_from_config(cfg.robot)
+
+    teleop_action_processor, robot_action_processor, robot_observation_processor = (
+        make_default_processors()
+    )
+
+    robot.connect()
+    print("✅ Robot connected:", robot.name)
+
+    listener, events = init_keyboard_listener()
+
+    log_say("Follower Control Started", cfg.play_sounds)
+
+    record_loop(
+        robot=robot,
+        events=events,
+        fps=cfg.dataset.fps,
+        teleop_action_processor=teleop_action_processor,
+        robot_action_processor=robot_action_processor,
+        robot_observation_processor=robot_observation_processor,
+        control_time_s=cfg.dataset.episode_time_s,
+        display_data=cfg.display_data,
+    )
+
+    robot.disconnect()
+
+    if not is_headless() and listener:
+        listener.stop()
+
+    log_say("Exiting", cfg.play_sounds)
+
+
+def main():
+    record()
+
+
+if __name__ == "__main__":
+    main()

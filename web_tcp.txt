@@ -1,0 +1,10 @@
+启动主臂，通过websocket将角度信息发送出去，ROS2接受到信息发布再出去，再用另一个节点订阅主臂信息，通过tcp传递到主程序开始录制数据集，再通过tcp将索引2的摄像头信息传递出去，ros2发布出去，主机通过ros2订阅并且显示索引为2的摄像头图像
+
+(lerobot) plac@plac:~/zyh_project/lerobot-new$ python src/lerobot/scripts/leader_ws_stream.py   --teleop.type=so100_leader   --teleop.port=/dev/ttyACM0   --teleop.id=master   --fps=30
+
+(ros2_web) plac@plac:~/zyh_project/lerobot-new$ python ros_web.py 
+
+(ros2_web) plac@plac:~/zyh_project/lerobot-new$ python ros2_to_ws.py
+
+(lerobot) plac@plac:~/zyh_project/lerobot-new$ python src/lerobot/scripts/follower_ws_record.py   --robot.type=so100_follower   --robot.port=/dev/ttyACM0    --robot.id=slave   --robot.cameras='{left: {"type": "opencv", "index_or_path": "/dev/video21", "width": 640, "height": 480, "fps": 10},right: {"type": "opencv", "index_or_path": "/dev/video23", "width": 640, "height": 480, "fps": 30}}'   --resume=true   --display_data=true   --dataset.repo_id=zhangyuheng1/so100_pi0_new_test   --dataset.num_episodes=10   --dataset.single_task="Raise the robotic arm, search for a red-and-white mouse box placed on the transparent shock-absorbing foam, move the arm above it, open the gripper, and grasp the red-and-white mouse box.After grasping it, place it in the right-side area, and then move the arm back to its initial position." --dataset.push_to_hub=false
+
