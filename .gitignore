@@ -1,0 +1,25 @@
+# ===== datasets / artifacts (绝对不进 Git) =====
+tests/artifacts/
+datasets/
+*.safetensors
+*.bag
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# ===== video / logs =====
+*.mp4
+*.avi
+*.mkv
+*.log
+
+# ===== python =====
+__pycache__/
+.env
+.venv
+
+# ===== ros2 =====
+build/
+install/
+log/
